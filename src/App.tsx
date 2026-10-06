@@ -79,12 +79,13 @@ import {
   Wifi,
   WifiOff
 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   colorPresets,
   detectConflicts,
   roleLabels,
-  statusLabels
+  statusLabels,
+  wouldCreateCycle
 } from './data';
 import {
   LIGHTING_STORAGE_KEY,
@@ -108,10 +109,16 @@ function conflictLabel(conflict: CueConflict) {
   return {
     'channel-overlap': '通道叠光',
     'follow-order': '跟随关系',
+    'follow-cycle': '跟随回路',
+    'broken-follow': '坏引用',
     'missing-data': '数据缺失',
     'duplicate-position': '灯位重复',
     duration: '时间异常'
   }[conflict.type];
+}
+
+function isBlockingCycle(conflict: CueConflict) {
+  return conflict.type === 'follow-cycle' && conflict.severity === 'error';
 }
 
 interface SortableCueRowProps {
@@ -139,7 +146,7 @@ function SortableCueRow({ cue, index, selected, disabled, conflicts, onSelect }:
       style={style}
       role="option"
       aria-selected={selected}
-      aria-label={`${cue.number} ${cue.label}，${statusLabels[cue.status]}，${conflicts.length} 个冲突`}
+      aria-label={`${cue.number} ${cue.label}，${statusLabels[cue.status]}，${cue.startTime === undefined ? '未排定，' : ''}${conflicts.length} 个冲突`}
       className={`cue-row ${selected ? 'active' : ''} ${isDragging ? 'dragging' : ''}`}
       borderBottomWidth="1px"
       borderColor="whiteAlpha.100"
@@ -164,7 +171,11 @@ function SortableCueRow({ cue, index, selected, disabled, conflicts, onSelect }:
         </Text>
         <Box w="84px">
           <Text fontFamily="mono" fontWeight="700" color="amber.300">{cue.number}</Text>
-          <Text color="whiteAlpha.500" fontSize="10px">{formatTime(cue.startTime)}</Text>
+          {cue.startTime === undefined ? (
+            <Text color="red.300" fontSize="10px">未排定</Text>
+          ) : (
+            <Text color="whiteAlpha.500" fontSize="10px">{formatTime(cue.startTime)}</Text>
+          )}
         </Box>
         <Box className="color-swatch" bg={cue.colorHex} boxSize="14px" flexShrink={0} />
         <Box minW={0} flex="1">
@@ -278,12 +289,21 @@ function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDe
     setDraft((current) => (current ? { ...current, [key]: value } : current));
   };
 
+  const followWouldCycle = wouldCreateCycle(scene, cue.id, draft.followCueId);
+
   return (
     <VStack align="stretch" spacing={4}>
       <Flex align="center">
         <Box>
           <Heading size="sm">{cue.number} · {cue.label}</Heading>
-          <Text color="whiteAlpha.500" fontSize="xs">开始 {formatTime(cue.startTime)} · 总时长 {cue.duration?.toFixed(1)}s</Text>
+          <Text color="whiteAlpha.500" fontSize="xs">
+            {cue.startTime === undefined ? (
+              <Text as="span" color="red.300">未排定 · 跟随回路未解决</Text>
+            ) : (
+              <>开始 {formatTime(cue.startTime)}</>
+            )}
+            {' '}· 总时长 {cue.duration?.toFixed(1)}s
+          </Text>
         </Box>
         <Spacer />
         <Tag colorScheme={statusColors[cue.status]}>{statusLabels[cue.status]}</Tag>
@@ -393,6 +413,9 @@ function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDe
           ))}
         </Select>
         <Text mt={1} color="whiteAlpha.500" fontSize="11px">跟随目标结束后触发；时间会在拖拽或参数变化后自动重算。</Text>
+        {followWouldCycle ? (
+          <Text mt={1} color="red.300" fontSize="11px">该选择会形成跟随回路；应用后回路内提示将退出待执行并暂停排定。</Text>
+        ) : null}
       </FormControl>
 
       <FormControl>
@@ -517,6 +540,76 @@ function ConflictList({
   );
 }
 
+function PendingList({
+  plan,
+  conflicts,
+  role,
+  onSelect,
+  onClear
+}: {
+  plan: LightingPlan;
+  conflicts: CueConflict[];
+  role: UserRole;
+  onSelect: (sceneId: string, cueId: string) => void;
+  onClear: (sceneId: string, cueId: string) => void;
+}) {
+  if (!conflicts.length) {
+    return (
+      <Flex minH="240px" align="center" justify="center" color="green.300" textAlign="center">
+        <Box>
+          <ShieldCheck size={36} style={{ margin: '0 auto 10px' }} />
+          <Text>没有待处理的坏引用</Text>
+        </Box>
+      </Flex>
+    );
+  }
+
+  return (
+    <VStack align="stretch" spacing={3}>
+      <Text color="whiteAlpha.500" fontSize="xs">
+        以下提示的跟随目标已不存在（多来自旧草稿或跨方案复制），修复前不会参与正常排期核对。
+      </Text>
+      {conflicts.map((conflict) => {
+        const scene = plan.scenes.find((item) => item.id === conflict.sceneId);
+        const clearable = canEditScene(role, scene);
+        return (
+          <Box
+            key={conflict.id}
+            p={3}
+            borderRadius="lg"
+            borderWidth="1px"
+            borderColor="red.700"
+            bg="red.900"
+          >
+            <HStack mb={1}>
+              <AlertCircle size={15} color="#fc8181" />
+              <Text fontSize="xs" color="whiteAlpha.700">坏引用 · {scene?.name ?? '未知场次'}</Text>
+              {scene?.frozen ? <Tag size="sm" colorScheme="green">已冻结</Tag> : null}
+            </HStack>
+            <Text fontSize="sm">{conflict.message}</Text>
+            <HStack mt={2}>
+              <Button size="xs" variant="outline" onClick={() => onSelect(conflict.sceneId, conflict.cueId)}>
+                定位提示
+              </Button>
+              <Tooltip label={clearable ? '将该提示的跟随目标置空' : '场次已冻结或当前角色无编辑权限'}>
+                <Button
+                  size="xs"
+                  colorScheme="red"
+                  variant="ghost"
+                  isDisabled={!clearable}
+                  onClick={() => onClear(conflict.sceneId, conflict.cueId)}
+                >
+                  清除坏引用
+                </Button>
+              </Tooltip>
+            </HStack>
+          </Box>
+        );
+      })}
+    </VStack>
+  );
+}
+
 function ComparePlan({
   activePlan,
   comparePlan,
@@ -586,13 +679,30 @@ export default function App() {
   const editable = canEditScene(workspace.role, activeScene);
   const freezer = canFreeze(workspace.role);
   const incompleteCount = activePlan.scenes.flatMap((scene) => scene.cues).filter((cue) => cue.status !== 'confirmed').length;
+  const planCycleConflicts = activeConflicts.filter(isBlockingCycle);
+  const sceneCycleConflicts = activeScene
+    ? planCycleConflicts.filter((item) => item.sceneId === activeScene.id)
+    : [];
+  const cycleCueIds = new Set(planCycleConflicts.map((item) => item.cueId));
+  const pendingConflicts = activeConflicts.filter((item) => item.type === 'broken-follow');
+  // 跨标签页同步的回声防护：记录本标签页最近一次写入的草稿内容
+  const lastWrittenRef = useRef('');
 
   useEffect(() => {
     try {
       const raw = localStorage.getItem(LIGHTING_STORAGE_KEY);
       if (raw) {
+        lastWrittenRef.current = raw;
         const parsed = JSON.parse(raw) as Workspace;
-        if (parsed.plans?.length) dispatch({ type: 'hydrate', workspace: parsed });
+        if (parsed.plans?.length) {
+          dispatch({ type: 'hydrate', workspace: parsed });
+          const restored = detectConflicts(parsed.plans);
+          const cycles = restored.filter(isBlockingCycle).length;
+          const broken = restored.filter((item) => item.type === 'broken-follow').length;
+          if (cycles || broken) {
+            setSyncMessage(`离线草稿已恢复：${cycles} 处跟随回路已退出待执行，${broken} 处坏引用列入待处理`);
+          }
+        }
       }
     } catch {
       setSyncMessage('离线草稿损坏，已载入模拟方案');
@@ -604,11 +714,38 @@ export default function App() {
   useEffect(() => {
     if (!hydrated) return;
     const timer = window.setTimeout(() => {
-      localStorage.setItem(LIGHTING_STORAGE_KEY, JSON.stringify(workspace));
+      const serialized = JSON.stringify(workspace);
+      lastWrittenRef.current = serialized;
+      localStorage.setItem(LIGHTING_STORAGE_KEY, serialized);
       setSavedAt(new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }));
     }, 400);
     return () => window.clearTimeout(timer);
   }, [hydrated, workspace]);
+
+  // 两个标签页同时编辑：另一标签页写入草稿后，本标签页同步并重新检查回路
+  useEffect(() => {
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key !== LIGHTING_STORAGE_KEY || !event.newValue) return;
+      if (event.newValue === lastWrittenRef.current) return;
+      try {
+        const parsed = JSON.parse(event.newValue) as Workspace;
+        if (!parsed.plans?.length) return;
+        lastWrittenRef.current = event.newValue;
+        dispatch({ type: 'hydrate', workspace: parsed });
+        const restored = detectConflicts(parsed.plans);
+        const cycles = restored.filter(isBlockingCycle).length;
+        setSyncMessage(
+          cycles
+            ? `已同步另一标签页的修改：检测到 ${cycles} 处跟随回路，相关提示退出待执行`
+            : '已同步另一标签页的修改，跟随关系重新检查通过'
+        );
+      } catch {
+        setSyncMessage('另一标签页的草稿无法解析，已保留本地版本');
+      }
+    };
+    window.addEventListener('storage', handleStorage);
+    return () => window.removeEventListener('storage', handleStorage);
+  }, []);
 
   useEffect(() => {
     const handleOnline = () => setOnline(true);
@@ -638,6 +775,7 @@ export default function App() {
   }
 
   function applyCue(draft: Cue) {
+    const createsCycle = activeScene ? wouldCreateCycle(activeScene, draft.id, draft.followCueId) : false;
     commit('应用提示参数并重算', (next) => {
       const cue = next.plans
         .find((plan) => plan.id === next.activePlanId)
@@ -647,7 +785,16 @@ export default function App() {
       const { startTime: _start, duration: _duration, endTime: _end, ...fields } = draft;
       Object.assign(cue, fields);
     });
-    toast({ title: '提示参数已应用', status: 'success', duration: 1800 });
+    if (createsCycle) {
+      toast({
+        title: '已应用，但检测到跟随回路',
+        description: '回路内提示已退出待执行并暂停排定，解除回路后才能冻结或导出。',
+        status: 'warning',
+        duration: 3200
+      });
+    } else {
+      toast({ title: '提示参数已应用', status: 'success', duration: 1800 });
+    }
   }
 
   function deleteCue() {
@@ -697,6 +844,15 @@ export default function App() {
       toast({ title: '当前角色不能冻结或解冻场次', status: 'warning' });
       return;
     }
+    if (!activeScene.frozen && sceneCycleConflicts.length) {
+      toast({
+        title: '存在未解决的跟随回路，无法冻结',
+        description: '请先解除回路，让相关提示恢复可排定状态。',
+        status: 'error',
+        duration: 3200
+      });
+      return;
+    }
     commit(activeScene.frozen ? '解除场次冻结' : '冻结已确认场次', (next) => {
       const scene = next.plans.find((plan) => plan.id === next.activePlanId)?.scenes.find((item) => item.id === next.selectedSceneId);
       if (scene) scene.frozen = !scene.frozen;
@@ -739,23 +895,42 @@ export default function App() {
         if (cue.status !== 'confirmed' || hasConflict) all.push({ scene, cue });
       });
     }
-    const currentIndex = all.findIndex((item) => item.cue.id === selectedCue?.id);
-    const target = all[(currentIndex + 1) % Math.max(1, all.length)];
+    // 未解决回路优先拦截：先在回路提示间循环，再处理其余未完成项
+    const cycleTargets = all.filter((item) => cycleCueIds.has(item.cue.id));
+    const pool = cycleTargets.length ? cycleTargets : all;
+    const currentIndex = pool.findIndex((item) => item.cue.id === selectedCue?.id);
+    const target = pool[(currentIndex + 1) % Math.max(1, pool.length)];
     if (!target) {
       toast({ title: '所有提示均已完成且无阻断冲突', status: 'success' });
       return;
     }
     dispatch({ type: 'selectCue', sceneId: target.scene.id, cueId: target.cue.id });
+    if (cycleCueIds.has(target.cue.id)) {
+      toast({ title: `${target.cue.number} 处于未解决跟随回路`, status: 'error', duration: 2200 });
+    }
     window.setTimeout(() => document.getElementById(`cue-${target.cue.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 50);
   }
 
   async function persistNow() {
     setSyncMessage('正在模拟同步到制作服务器…');
     await new Promise((resolve) => window.setTimeout(resolve, 320));
-    localStorage.setItem(LIGHTING_STORAGE_KEY, JSON.stringify(workspace));
+    const serialized = JSON.stringify(workspace);
+    lastWrittenRef.current = serialized;
+    localStorage.setItem(LIGHTING_STORAGE_KEY, serialized);
     setSavedAt(new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }));
     setSyncMessage('模拟接口返回 200，本地草稿保持一致');
     toast({ title: '当前方案已保存', description: syncMessage, status: 'success', duration: 2200 });
+  }
+
+  function clearBrokenFollow(sceneId: string, cueId: string) {
+    commit('清除坏引用并重算', (next) => {
+      const cue = next.plans
+        .find((plan) => plan.id === next.activePlanId)
+        ?.scenes.find((scene) => scene.id === sceneId)
+        ?.cues.find((item) => item.id === cueId);
+      if (cue) cue.followCueId = '';
+    });
+    toast({ title: '已清除坏引用，提示恢复顺序触发', status: 'success', duration: 2000 });
   }
 
   useEffect(() => {
@@ -801,6 +976,15 @@ export default function App() {
   }
 
   function exportPlan() {
+    if (planCycleConflicts.length) {
+      toast({
+        title: '导出已拦截',
+        description: `当前方案存在 ${planCycleConflicts.length} 处未解决跟随回路，请先处理再导出。`,
+        status: 'error',
+        duration: 3200
+      });
+      return;
+    }
     const payload = {
       exportedAt: new Date().toISOString(),
       plan: activePlan,
@@ -927,10 +1111,11 @@ export default function App() {
                         <Text fontWeight="650" fontSize="sm" flex="1" noOfLines={1}>{scene.name}</Text>
                         {scene.frozen ? <Lock size={13} color="#9ae6b4" /> : <Unlock size={13} color="#718096" />}
                       </Flex>
-                      <Flex mt={2} color="whiteAlpha.500" fontSize="10px" gap={2}>
+                      <Flex mt={2} color="whiteAlpha.500" fontSize="10px" gap={2} align="center">
                         <Text>{formatTime(scene.duration)}</Text>
                         <Text>{scene.cues.length} 条</Text>
                         <Text color={sceneConflicts.length ? 'orange.300' : 'green.300'}>{sceneConflicts.length} 冲突</Text>
+                        {scene.affectedByUpstream ? <Tag size="sm" colorScheme="orange">受上游影响</Tag> : null}
                       </Flex>
                     </Box>
                   );
@@ -982,6 +1167,8 @@ export default function App() {
                     <Flex align="center" gap={2}>
                       <Heading size="md">{activeScene.name}</Heading>
                       {activeScene.frozen ? <Tag colorScheme="green"><HStack spacing={1}><Lock size={12} /><Text>已冻结</Text></HStack></Tag> : <Tag variant="subtle">编辑中</Tag>}
+                      {activeScene.affectedByUpstream ? <Tag colorScheme="orange">受上游影响</Tag> : null}
+                      {sceneCycleConflicts.length ? <Tag colorScheme="red">{sceneCycleConflicts.length} 处回路</Tag> : null}
                     </Flex>
                     <Text color="whiteAlpha.500" fontSize="sm" mt={1}>
                       场次开始 {formatTime(activeScene.startTime)} · 时长 {formatTime(activeScene.duration)} · {activeScene.cues.length} 条提示
@@ -997,6 +1184,23 @@ export default function App() {
                   </ButtonGroup>
                 </Flex>
 
+                {activeScene.affectedByUpstream ? (
+                  <Alert status="warning" borderRadius="lg" mt={3}>
+                    <AlertIcon />
+                    <AlertDescription fontSize="sm">
+                      该场次已冻结，上游场次时长变化未应用到本场次排期；解除冻结后将自动重算。
+                    </AlertDescription>
+                  </Alert>
+                ) : null}
+                {sceneCycleConflicts.length ? (
+                  <Alert status="error" borderRadius="lg" mt={3}>
+                    <AlertIcon />
+                    <AlertDescription fontSize="sm">
+                      本场次存在 {sceneCycleConflicts.length} 处未解决跟随回路，回路内提示已退出待执行并暂停排定；解除前无法冻结场次或导出方案。
+                    </AlertDescription>
+                  </Alert>
+                ) : null}
+
                 <Box mt={4}>
                   <Flex mb={2} align="center">
                     <Text color="whiteAlpha.600" fontSize="xs">自动重算时间轴</Text>
@@ -1004,25 +1208,38 @@ export default function App() {
                     <Text color="whiteAlpha.500" fontSize="xs">{formatTime(activeScene.startTime)} — {formatTime((activeScene.startTime ?? 0) + (activeScene.duration ?? 0))}</Text>
                   </Flex>
                   <Flex className="timeline-track" role="list" aria-label={`${activeScene.name}时间轴`}>
-                    {activeScene.cues.map((cue) => (
-                      <Tooltip key={cue.id} label={`${cue.number} ${cue.label}，${formatTime(cue.startTime)} 开始，持续 ${cue.duration?.toFixed(1)} 秒`}>
-                        <Box
-                          as="button"
-                          role="listitem"
-                          className="timeline-block focus-ring"
-                          aria-label={`时间轴 ${cue.number} ${cue.label}`}
-                          bg={cue.colorHex}
-                          color={cue.brightness > 55 ? '#111827' : '#fff'}
-                          flexGrow={Math.max(1, cue.duration ?? 1)}
-                          flexBasis={`${Math.max(40, (cue.duration ?? 1) * 14)}px`}
-                          borderLeft={cue.id === selectedCue?.id ? '3px solid #f6c453' : undefined}
-                          onClick={() => selectCue(activeScene.id, cue.id)}
+                    {activeScene.cues.map((cue) => {
+                      const unscheduled = cue.startTime === undefined;
+                      return (
+                        <Tooltip
+                          key={cue.id}
+                          label={
+                            unscheduled
+                              ? `${cue.number} ${cue.label} 未参与排定：跟随回路未解决`
+                              : `${cue.number} ${cue.label}，${formatTime(cue.startTime)} 开始，持续 ${cue.duration?.toFixed(1)} 秒`
+                          }
                         >
-                          <Text fontWeight="800">{cue.number}</Text>
-                          <Text noOfLines={1}>{cue.label}</Text>
-                        </Box>
-                      </Tooltip>
-                    ))}
+                          <Box
+                            as="button"
+                            role="listitem"
+                            className="timeline-block focus-ring"
+                            aria-label={`时间轴 ${cue.number} ${cue.label}${unscheduled ? '，未排定' : ''}`}
+                            bg={cue.colorHex}
+                            color={cue.brightness > 55 ? '#111827' : '#fff'}
+                            flexGrow={Math.max(1, cue.duration ?? 1)}
+                            flexBasis={`${Math.max(40, (cue.duration ?? 1) * 14)}px`}
+                            borderLeft={cue.id === selectedCue?.id ? '3px solid #f6c453' : undefined}
+                            border={unscheduled ? '2px dashed' : undefined}
+                            borderColor={unscheduled ? 'red.300' : undefined}
+                            opacity={unscheduled ? 0.45 : 1}
+                            onClick={() => selectCue(activeScene.id, cue.id)}
+                          >
+                            <Text fontWeight="800">{cue.number}</Text>
+                            <Text noOfLines={1}>{unscheduled ? '未排定' : cue.label}</Text>
+                          </Box>
+                        </Tooltip>
+                      );
+                    })}
                     {!activeScene.cues.length ? <Text p={3} color="whiteAlpha.500" fontSize="sm">时间轴暂无数据</Text> : null}
                   </Flex>
                 </Box>
@@ -1075,6 +1292,7 @@ export default function App() {
                 <Tab>提示编辑</Tab>
                 <Tab>冲突 <Badge ml={1} colorScheme={activeConflicts.length ? 'orange' : 'green'}>{activeConflicts.length}</Badge></Tab>
                 <Tab>关系图</Tab>
+                <Tab>待处理 <Badge ml={1} colorScheme={pendingConflicts.length ? 'red' : 'green'}>{pendingConflicts.length}</Badge></Tab>
               </TabList>
               <TabPanels>
                 <TabPanel px={4} pb={5}>
@@ -1103,20 +1321,38 @@ export default function App() {
                     <VStack align="stretch" spacing={3}>
                       {activeScene.cues.map((cue, index) => {
                         const followed = activeScene.cues.find((item) => item.id === cue.followCueId);
+                        const inCycle = cycleCueIds.has(cue.id);
+                        const brokenRef = Boolean(cue.followCueId) && !followed;
                         return (
-                          <Box key={cue.id} p={3} borderRadius="lg" bg="blackAlpha.200" borderWidth="1px" borderColor="whiteAlpha.100">
+                          <Box
+                            key={cue.id}
+                            p={3}
+                            borderRadius="lg"
+                            bg="blackAlpha.200"
+                            borderWidth="1px"
+                            borderColor={inCycle ? 'red.500' : brokenRef ? 'red.700' : 'whiteAlpha.100'}
+                          >
                             <Flex align="center" gap={2}>
                               <CircleDot size={14} color={cue.colorHex} />
                               <Text fontFamily="mono" color="amber.300" fontSize="sm">{cue.number}</Text>
                               <Text fontWeight="600" fontSize="sm" noOfLines={1}>{cue.label}</Text>
+                              {inCycle ? <Tag size="sm" colorScheme="red">回路</Tag> : null}
                               <Spacer />
-                              <Text color="whiteAlpha.500" fontSize="xs">{formatTime(cue.startTime)}</Text>
+                              {cue.startTime === undefined ? (
+                                <Text color="red.300" fontSize="xs">未排定</Text>
+                              ) : (
+                                <Text color="whiteAlpha.500" fontSize="xs">{formatTime(cue.startTime)}</Text>
+                              )}
                             </Flex>
-                            <Box ml={4} mt={3} borderLeftWidth="2px" borderColor={followed ? 'purple.400' : 'whiteAlpha.200'} pl={3}>
-                              {followed ? (
+                            <Box ml={4} mt={3} borderLeftWidth="2px" borderColor={inCycle || brokenRef ? 'red.400' : followed ? 'purple.400' : 'whiteAlpha.200'} pl={3}>
+                              {brokenRef ? (
+                                <Flex align="center" gap={1} color="red.300" fontSize="xs"><AlertCircle size={12} />坏引用：跟随目标不存在，已列入待处理</Flex>
+                              ) : followed ? (
                                 <>
-                                  <Flex align="center" gap={1} color="purple.300" fontSize="xs"><ArrowDown size={12} />跟随 {followed.number} · {followed.label}</Flex>
-                                  <Text mt={1} color="whiteAlpha.500" fontSize="10px">目标结束时间 {formatTime(followed.endTime)}</Text>
+                                  <Flex align="center" gap={1} color={inCycle ? 'red.300' : 'purple.300'} fontSize="xs"><ArrowDown size={12} />跟随 {followed.number} · {followed.label}</Flex>
+                                  <Text mt={1} color="whiteAlpha.500" fontSize="10px">
+                                    {followed.endTime === undefined ? '目标未排定（回路未解决）' : `目标结束时间 ${formatTime(followed.endTime)}`}
+                                  </Text>
                                 </>
                               ) : (
                                 <Flex align="center" gap={1} color="whiteAlpha.500" fontSize="xs"><Pause size={12} />按前一条结束或手动 GO 触发</Flex>
@@ -1128,6 +1364,15 @@ export default function App() {
                       })}
                     </VStack>
                   ) : null}
+                </TabPanel>
+                <TabPanel px={4} pb={5}>
+                  <PendingList
+                    plan={activePlan}
+                    conflicts={pendingConflicts}
+                    role={workspace.role}
+                    onSelect={(sceneId, cueId) => selectCue(sceneId, cueId)}
+                    onClear={clearBrokenFollow}
+                  />
                 </TabPanel>
               </TabPanels>
             </Tabs>

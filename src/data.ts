@@ -136,23 +136,100 @@ const tourPlan: LightingPlan = {
 
 export const samplePlans = [mainPlan, coolPlan, tourPlan];
 
+/**
+ * 跟随关系是可执行依赖：先找出完整回路（自跟随、互相跟随、长链成环），
+ * 回路成员与汇入回路的下游提示都不参与排期，避免时间轴给出“看似可用”的结果。
+ */
+export function findFollowCycles(scene: Scene): string[][] {
+  const byId = new Map(scene.cues.map((cue) => [cue.id, cue]));
+  const cycles: string[][] = [];
+  const mark = new Map<string, 'visiting' | 'done'>();
+  for (const cue of scene.cues) {
+    if (mark.has(cue.id)) continue;
+    const path: string[] = [];
+    let current: Cue | undefined = cue;
+    while (current && !mark.has(current.id)) {
+      mark.set(current.id, 'visiting');
+      path.push(current.id);
+      current = current.followCueId ? byId.get(current.followCueId) : undefined;
+    }
+    if (current && mark.get(current.id) === 'visiting') {
+      cycles.push(path.slice(path.indexOf(current.id)));
+    }
+    for (const id of path) mark.set(id, 'done');
+  }
+  return cycles;
+}
+
+/** 回路成员 + 跟随链汇入回路的下游提示，均不可排期 */
+export function findBlockedCueIds(scene: Scene): Set<string> {
+  const blocked = new Set(findFollowCycles(scene).flat());
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const cue of scene.cues) {
+      if (!blocked.has(cue.id) && cue.followCueId && blocked.has(cue.followCueId)) {
+        blocked.add(cue.id);
+        grew = true;
+      }
+    }
+  }
+  return blocked;
+}
+
+/** 预判：把 cueId 的跟随目标改为 followCueId 是否会成环 */
+export function wouldCreateCycle(scene: Scene, cueId: string, followCueId: string): boolean {
+  if (!followCueId) return false;
+  if (followCueId === cueId) return true;
+  const byId = new Map(scene.cues.map((cue) => [cue.id, cue]));
+  const seen = new Set<string>([cueId]);
+  let current = byId.get(followCueId);
+  while (current) {
+    if (current.id === cueId) return true;
+    if (seen.has(current.id)) return false;
+    seen.add(current.id);
+    current = current.followCueId ? byId.get(current.followCueId) : undefined;
+  }
+  return false;
+}
+
 export function recalculatePlans(plans: LightingPlan[]) {
   for (const plan of plans) {
     const scenes = [...plan.scenes].sort((a, b) => a.order - b.order);
     let absoluteCursor = 0;
     for (const scene of scenes) {
+      // 冻结场次不重排：保留既有排期，仅在上游时长变化时标记受影响
+      if (scene.frozen && scene.startTime !== undefined && scene.duration !== undefined) {
+        scene.affectedByUpstream = Math.abs(scene.startTime - absoluteCursor) > 0.05;
+        absoluteCursor = Number((scene.startTime + scene.duration).toFixed(2));
+        continue;
+      }
+      scene.affectedByUpstream = false;
       scene.startTime = absoluteCursor;
+      const blocked = findBlockedCueIds(scene);
+      const cycleMembers = new Set(findFollowCycles(scene).flat());
       let sceneCursor = absoluteCursor;
       for (const item of scene.cues) {
         const duration = Math.max(0.1, item.fadeIn + item.hold + item.fadeOut);
         item.duration = Number(duration.toFixed(2));
+        if (blocked.has(item.id)) {
+          item.startTime = undefined;
+          item.endTime = undefined;
+          continue;
+        }
         const followed = item.followCueId
           ? scene.cues.find((candidate) => candidate.id === item.followCueId)
           : undefined;
-        const followTime = followed?.endTime ? followed.endTime : sceneCursor;
+        const followTime = followed?.endTime ?? sceneCursor;
         item.startTime = Number(Math.max(sceneCursor, followTime).toFixed(2));
         item.endTime = Number((item.startTime + duration).toFixed(2));
         sceneCursor = Math.max(sceneCursor, item.endTime);
+      }
+      // 回路提示退出待执行（冻结场次保持只读，仅通过冲突面板标记）
+      if (!scene.frozen) {
+        for (const item of scene.cues) {
+          if (cycleMembers.has(item.id) && item.status === 'ready') item.status = 'draft';
+        }
       }
       scene.duration = Number(Math.max(0, sceneCursor - absoluteCursor).toFixed(2));
       absoluteCursor = sceneCursor;
@@ -167,6 +244,59 @@ export function detectConflicts(plans: LightingPlan[]): CueConflict[] {
     for (const scene of plan.scenes) {
       const byChannel = new Map<string, Cue[]>();
       const positions = new Map<string, Cue[]>();
+      const byId = new Map(scene.cues.map((cue) => [cue.id, cue]));
+
+      // 跟随回路：自跟随与互相跟随的完整环路，回路成员一律报错
+      const cycles = findFollowCycles(scene);
+      const cycleMembers = new Set(cycles.flat());
+      const cycleLabel = (ids: string[]) =>
+        [...ids, ids[0]].map((id) => byId.get(id)?.number ?? '?').join(' → ');
+      for (const ids of cycles) {
+        const label = cycleLabel(ids);
+        for (const cueId of ids) {
+          conflicts.push({
+            id: `${plan.id}-${scene.id}-${cueId}-cycle`,
+            planId: plan.id,
+            sceneId: scene.id,
+            cueId,
+            severity: 'error',
+            type: 'follow-cycle',
+            message:
+              ids.length === 1
+                ? `${byId.get(cueId)?.number ?? '?'} 跟随自身形成回路，已退出待执行`
+                : `跟随回路未解决：${label}，回路内提示已退出待执行`
+          });
+        }
+      }
+      // 跟随链汇入回路的下游提示：暂停排定并给出警告
+      for (const item of scene.cues) {
+        if (cycleMembers.has(item.id)) continue;
+        const seen = new Set<string>([item.id]);
+        let current = item;
+        let hit: string[] | undefined;
+        while (current.followCueId) {
+          const next = byId.get(current.followCueId);
+          if (!next || seen.has(next.id)) break;
+          if (cycleMembers.has(next.id)) {
+            hit = cycles.find((cycle) => cycle.includes(next.id));
+            break;
+          }
+          seen.add(next.id);
+          current = next;
+        }
+        if (hit) {
+          conflicts.push({
+            id: `${plan.id}-${scene.id}-${item.id}-cycle-downstream`,
+            planId: plan.id,
+            sceneId: scene.id,
+            cueId: item.id,
+            severity: 'warning',
+            type: 'follow-cycle',
+            message: `${item.number} 的跟随链汇入未解决回路（${cycleLabel(hit)}），已暂停排定`
+          });
+        }
+      }
+
       for (const item of scene.cues) {
         const errors: string[] = [];
         if (!item.channel.trim()) errors.push('缺少通道');
@@ -194,10 +324,10 @@ export function detectConflicts(plans: LightingPlan[]): CueConflict[] {
             sceneId: scene.id,
             cueId: item.id,
             severity: 'error',
-            type: 'follow-order',
-            message: `${item.number} 的跟随提示不存在于当前场次`
+            type: 'broken-follow',
+            message: `${item.number} 的跟随目标不存在（坏引用），已列入待处理`
           });
-        } else if ((followed.startTime ?? 0) >= (item.startTime ?? 0)) {
+        } else if ((followed.startTime ?? 0) >= (item.startTime ?? 0) && item.startTime !== undefined) {
           conflicts.push({
             id: `${plan.id}-${scene.id}-${item.id}-follow-order`,
             planId: plan.id,
@@ -212,6 +342,8 @@ export function detectConflicts(plans: LightingPlan[]): CueConflict[] {
 
       const sorted = [...scene.cues].sort((a, b) => (a.startTime ?? 0) - (b.startTime ?? 0));
       for (const item of sorted) {
+        // 未排定的提示不参与时间叠光判断
+        if (item.startTime === undefined) continue;
         const previous = byChannel.get(item.channel)?.at(-1);
         if (previous && (item.startTime ?? 0) < (previous.endTime ?? 0) - 0.01) {
           conflicts.push({

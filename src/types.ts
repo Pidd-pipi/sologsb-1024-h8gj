@@ -30,6 +30,8 @@ export interface Scene {
   frozen: boolean;
   startTime?: number;
   duration?: number;
+  /** 冻结场次保持原排期，但上游场次时长变化时标记为受影响 */
+  affectedByUpstream?: boolean;
   cues: Cue[];
 }
 
@@ -47,7 +49,7 @@ export interface CueConflict {
   cueId: string;
   sceneId: string;
   severity: ConflictSeverity;
-  type: 'channel-overlap' | 'follow-order' | 'missing-data' | 'duplicate-position' | 'duration';
+  type: 'channel-overlap' | 'follow-order' | 'follow-cycle' | 'broken-follow' | 'missing-data' | 'duplicate-position' | 'duration';
   message: string;
 }
 
