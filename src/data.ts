@@ -136,26 +136,135 @@ const tourPlan: LightingPlan = {
 
 export const samplePlans = [mainPlan, coolPlan, tourPlan];
 
+/**
+ * 找出场次内所有跟随回路（包括自己跟随自己、互相跟随）。
+ * 每条提示最多一个出边，沿跟随链走一遍即可定位完整回路。
+ * 返回值为回路成员 cue id 数组（按链路顺序）。
+ */
+export function findFollowCycles(scene: Scene): string[][] {
+  const byId = new Map(scene.cues.map((cue) => [cue.id, cue]));
+  const visitState = new Map<string, 1 | 2>();
+  const reported = new Set<string>();
+  const cycles: string[][] = [];
+  for (const cue of scene.cues) {
+    if (visitState.has(cue.id)) continue;
+    const path: string[] = [];
+    let current: Cue | undefined = cue;
+    while (current) {
+      const state = visitState.get(current.id);
+      if (state === 1) {
+        const cycle = path.slice(path.indexOf(current.id));
+        if (cycle.length && !cycle.some((id) => reported.has(id))) {
+          cycle.forEach((id) => reported.add(id));
+          cycles.push(cycle);
+        }
+        break;
+      }
+      if (state === 2) break;
+      visitState.set(current.id, 1);
+      path.push(current.id);
+      current = current.followCueId ? byId.get(current.followCueId) : undefined;
+    }
+    for (const id of path) visitState.set(id, 2);
+  }
+  return cycles;
+}
+
+/** 无法排定执行时间的提示：回路成员 + 跟随链进入回路的下游提示。 */
+export function findUnresolvableCueIds(scene: Scene): Set<string> {
+  const blocked = new Set<string>(findFollowCycles(scene).flat());
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const cue of scene.cues) {
+      if (!blocked.has(cue.id) && cue.followCueId && blocked.has(cue.followCueId)) {
+        blocked.add(cue.id);
+        grew = true;
+      }
+    }
+  }
+  return blocked;
+}
+
+/** 直接或间接跟随 rootId 的全部下游提示。 */
+export function findDownstreamCueIds(scene: Scene, rootId: string): Set<string> {
+  const downstream = new Set<string>();
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const cue of scene.cues) {
+      if (cue.id === rootId || downstream.has(cue.id)) continue;
+      if (cue.followCueId && (cue.followCueId === rootId || downstream.has(cue.followCueId))) {
+        downstream.add(cue.id);
+        grew = true;
+      }
+    }
+  }
+  return downstream;
+}
+
+/** 统计指向不存在目标的坏跟随引用（旧草稿常见）。 */
+export function countBrokenFollowRefs(plans: LightingPlan[]): number {
+  let count = 0;
+  for (const plan of plans) {
+    for (const scene of plan.scenes) {
+      const ids = new Set(scene.cues.map((cue) => cue.id));
+      for (const cue of scene.cues) {
+        if (cue.followCueId && !ids.has(cue.followCueId)) count += 1;
+      }
+    }
+  }
+  return count;
+}
+
 export function recalculatePlans(plans: LightingPlan[]) {
   for (const plan of plans) {
     const scenes = [...plan.scenes].sort((a, b) => a.order - b.order);
     let absoluteCursor = 0;
     for (const scene of scenes) {
       scene.startTime = absoluteCursor;
+      const byId = new Map(scene.cues.map((cue) => [cue.id, cue]));
+      const blocked = findUnresolvableCueIds(scene);
       let sceneCursor = absoluteCursor;
-      for (const item of scene.cues) {
-        const duration = Math.max(0.1, item.fadeIn + item.hold + item.fadeOut);
-        item.duration = Number(duration.toFixed(2));
-        const followed = item.followCueId
-          ? scene.cues.find((candidate) => candidate.id === item.followCueId)
-          : undefined;
-        const followTime = followed?.endTime ? followed.endTime : sceneCursor;
-        item.startTime = Number(Math.max(sceneCursor, followTime).toFixed(2));
-        item.endTime = Number((item.startTime + duration).toFixed(2));
-        sceneCursor = Math.max(sceneCursor, item.endTime);
+      const resolved = new Set<string>();
+      // 依赖驱动排程：先解算跟随目标，再排定当前提示；回路及其下游不产出伪时间。
+      const resolveCue = (cue: Cue) => {
+        if (resolved.has(cue.id)) return;
+        resolved.add(cue.id);
+        const duration = Math.max(0.1, cue.fadeIn + cue.hold + cue.fadeOut);
+        cue.duration = Number(duration.toFixed(2));
+        if (blocked.has(cue.id)) {
+          cue.startTime = undefined;
+          cue.endTime = undefined;
+          return;
+        }
+        const target = cue.followCueId ? byId.get(cue.followCueId) : undefined;
+        if (target) resolveCue(target);
+        const followTime = target?.endTime ?? sceneCursor;
+        cue.startTime = Number(Math.max(sceneCursor, followTime).toFixed(2));
+        cue.endTime = Number((cue.startTime + duration).toFixed(2));
+        sceneCursor = Math.max(sceneCursor, cue.endTime);
+      };
+      for (const cue of scene.cues) resolveCue(cue);
+      // 回路提示退出待执行；冻结场次保持只读，不改状态。
+      if (!scene.frozen) {
+        for (const cue of scene.cues) {
+          if (blocked.has(cue.id) && cue.status === 'ready') cue.status = 'draft';
+        }
       }
       scene.duration = Number(Math.max(0, sceneCursor - absoluteCursor).toFixed(2));
       absoluteCursor = sceneCursor;
+      // 冻结场次不重排，只对照冻结基线标明是否受上游影响。
+      if (scene.frozen) {
+        if (!scene.frozenBaseline) {
+          scene.frozenBaseline = { startTime: scene.startTime, duration: scene.duration };
+        }
+        scene.upstreamAffected =
+          Math.abs(scene.startTime - scene.frozenBaseline.startTime) > 0.05 ||
+          Math.abs(scene.duration - scene.frozenBaseline.duration) > 0.05;
+      } else {
+        scene.upstreamAffected = false;
+      }
     }
   }
   return plans;
@@ -167,6 +276,43 @@ export function detectConflicts(plans: LightingPlan[]): CueConflict[] {
     for (const scene of plan.scenes) {
       const byChannel = new Map<string, Cue[]>();
       const positions = new Map<string, Cue[]>();
+      const cycles = findFollowCycles(scene);
+      const cycleMembers = new Set(cycles.flat());
+      const blocked = findUnresolvableCueIds(scene);
+      const numberOf = (id: string) => scene.cues.find((cue) => cue.id === id)?.number ?? '?';
+
+      for (const cycle of cycles) {
+        const labels = cycle.map(numberOf);
+        const message =
+          cycle.length === 1
+            ? `${labels[0]} 跟随自身，形成无法执行的回路`
+            : `跟随回路未解决：${[...labels, labels[0]].join(' → ')}`;
+        for (const cueId of cycle) {
+          conflicts.push({
+            id: `${plan.id}-${scene.id}-${cueId}-follow-cycle`,
+            planId: plan.id,
+            sceneId: scene.id,
+            cueId,
+            severity: 'error',
+            type: 'follow-cycle',
+            message
+          });
+        }
+      }
+      for (const item of scene.cues) {
+        if (blocked.has(item.id) && !cycleMembers.has(item.id)) {
+          conflicts.push({
+            id: `${plan.id}-${scene.id}-${item.id}-follow-cycle-downstream`,
+            planId: plan.id,
+            sceneId: scene.id,
+            cueId: item.id,
+            severity: 'warning',
+            type: 'follow-cycle',
+            message: `${item.number} 的跟随链进入未解决的回路，执行时间暂无法排定`
+          });
+        }
+      }
+
       for (const item of scene.cues) {
         const errors: string[] = [];
         if (!item.channel.trim()) errors.push('缺少通道');
@@ -197,7 +343,7 @@ export function detectConflicts(plans: LightingPlan[]): CueConflict[] {
             type: 'follow-order',
             message: `${item.number} 的跟随提示不存在于当前场次`
           });
-        } else if ((followed.startTime ?? 0) >= (item.startTime ?? 0)) {
+        } else if (!blocked.has(item.id) && scene.cues.indexOf(followed) > scene.cues.indexOf(item)) {
           conflicts.push({
             id: `${plan.id}-${scene.id}-${item.id}-follow-order`,
             planId: plan.id,
@@ -205,12 +351,14 @@ export function detectConflicts(plans: LightingPlan[]): CueConflict[] {
             cueId: item.id,
             severity: 'warning',
             type: 'follow-order',
-            message: `${item.number} 的跟随目标不在其之前完成`
+            message: `${item.number} 的跟随目标排在它之后，已按依赖关系重算执行时间`
           });
         }
       }
 
-      const sorted = [...scene.cues].sort((a, b) => (a.startTime ?? 0) - (b.startTime ?? 0));
+      const sorted = [...scene.cues]
+        .filter((item) => !blocked.has(item.id))
+        .sort((a, b) => (a.startTime ?? 0) - (b.startTime ?? 0));
       for (const item of sorted) {
         const previous = byChannel.get(item.channel)?.at(-1);
         if (previous && (item.startTime ?? 0) < (previous.endTime ?? 0) - 0.01) {

@@ -170,7 +170,8 @@ export function canFreeze(role: UserRole) {
 }
 
 export function formatTime(value: number | undefined) {
-  const safe = Math.max(0, value ?? 0);
+  if (value === undefined || Number.isNaN(value)) return '—';
+  const safe = Math.max(0, value);
   const minutes = Math.floor(safe / 60);
   const seconds = Math.floor(safe % 60);
   const tenths = Math.floor((safe % 1) * 10);
